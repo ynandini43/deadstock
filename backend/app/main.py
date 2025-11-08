@@ -22,6 +22,19 @@ def search_items(keyword: str):
 @app.get("/recommendations")
 def get_recommendations(product_id: str = Query(...), top_k: int = 5):
     return {"product_id": product_id, "recommendations": recommender.recommend_for_product_id(product_id, top_k)}
+from fastapi.middleware.cors import CORSMiddleware
+
+app = FastAPI(title="Deadstock Dilemma AI Backend", version="1.4.0")
+
+# For initial deploy keep it open; later restrict to your Render frontend URL
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # replace with ["https://your-frontend.onrender.com"] later
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 @app.get("/redistribution_plan")
 def redistribution_plan(
