@@ -1,323 +1,411 @@
-import pandas as pd
+"""
+Deadstock Dilemma - Core data loader and business logic.
+
+- Robust path resolution using DATA_DIR (or backend/data)
+- Inventory CSV: processed_inventory.csv (required)
+- Partners CSV: partners.csv (optional but recommended)
+- Donations log: donations_log.csv (auto-created if missing)
+- Similarity: TF-IDF over a text_feature composed from item meta
+- Redistribution: simple demand-gap heuristic with tunable tolerance
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+import os
+
+import numpy as np
+import pandas as pd
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.neighbors import NearestNeighbors
 from sklearn.metrics.pairwise import cosine_similarity
 
 
+@dataclass
+class Columns:
+    product_id: str = "product_id"
+    category: str = "category"
+    region: str = "region"
+    inventory: str = "inventory_level"
+    sold: str = "units_sold"
+    forecast: str = "demand_forecast"
+    price: str = "price"
+    discount: str = "discount"
+    weather: str = "weather_condition"
+    promo: str = "holiday/promotion"
+    competitor: str = "competitor_pricing"
+    text_feature: str = "text_feature"  # created at load if missing
+
+
 class DeadstockRecommender:
-    """
-    - Loads/creates processed_inventory.csv
-    - Search + content-based recommendations
-    - Redistribution planner:
-        * category-aware regional balancing
-        * sell-through driven gap (robust when dataset has no true shortages)
-        * tolerance to allow near-balanced regions
-        * fallback so you always get a plan
-    """
+    def __init__(self) -> None:
+        # Base directory = backend/ (this file is backend/app/recommender.py)
+        base_dir = Path(__file__).resolve().parent.parent
+        # Prefer an external DATA_DIR (Render), else repo folder backend/data
+        self.data_dir = Path(os.getenv("DATA_DIR", base_dir / "data"))
+        self.data_dir.mkdir(parents=True, exist_ok=True)
 
-    def __init__(self, processed_csv: str = "backend/data/processed_inventory.csv"):
-        self.processed_path = self._ensure_processed_csv(processed_csv)
-        print(f"📂 Loading data from: {self.processed_path}")
-        self.df = pd.read_csv(self.processed_path)
+        self.cols = Columns()
 
-        # normalize columns
-        self.df.columns = [c.strip().replace(" ", "_").lower() for c in self.df.columns]
-        required = {
-            "product_id",
-            "category",
-            "region",
-            "inventory_level",
-            "units_sold",
-            "deadstock_flag",
-            "text_feature",
-        }
-        missing = required - set(self.df.columns)
-        if missing:
-            raise KeyError(f"Processed CSV missing columns: {missing}")
+        self.inventory_csv = self.data_dir / "processed_inventory.csv"
+        self.partners_csv = self.data_dir / "partners.csv"
+        self.donations_log = self.data_dir / "donations_log.csv"
 
-        # embeddings & index for recommendations/search
-        self.vectorizer = TfidfVectorizer(max_features=5000, ngram_range=(1, 2))
-        self.embeddings = self.vectorizer.fit_transform(self.df["text_feature"].fillna(""))
-        self.nn = NearestNeighbors(n_neighbors=10, metric="cosine").fit(self.embeddings)
-        print(f"✅ Loaded {len(self.df)} inventory items successfully.")
-
-    # --------------------------- Public helpers ---------------------------
-
-    def get_inventory(self, limit=10):
-        return self.df.head(limit).to_dict(orient="records")
-
-    def search(self, keyword: str):
-        mask = self.df["text_feature"].str.contains(keyword, case=False, na=False)
-        return self.df[mask].head(10).to_dict(orient="records")
-
-    def recommend_for_product_id(self, pid: str, top_k: int = 5):
-        idx = self._index_for_pid(pid)
-        if idx is None:
-            return []
-        return self._recommend_by_index(idx, top_k=top_k)
-
-    # --------------------------- Recommendations --------------------------
-
-    def _recommend_by_index(self, idx: int, top_k: int = 5):
-        q = self.embeddings[idx]
-        n = min(top_k + 1, len(self.df))
-        dists, idxs = self.nn.kneighbors(q, n_neighbors=n)
-        results = []
-        for dist, i in zip(dists[0], idxs[0]):
-            if i == idx:
-                continue  # skip self
-            row = self.df.iloc[i]
-            results.append(
-                {
-                    "Product_ID": row.get("product_id"),
-                    "Category": row.get("category"),
-                    "Region": row.get("region"),
-                    "Distance": round(float(dist), 3),
-                    "Deadstock": bool(row.get("deadstock_flag", False)),
-                }
+        if not self.inventory_csv.exists():
+            raise FileNotFoundError(
+                f"Inventory CSV missing: {self.inventory_csv}\n"
+                "Ensure backend/data/processed_inventory.csv is committed, "
+                "or DATA_DIR points to a folder that contains it."
             )
-        return results
 
-    # --------------------------- Redistribution --------------------------
+        # Load and normalize inventory
+        self.df: pd.DataFrame = pd.read_csv(self.inventory_csv)
+        self._normalize_columns()
+        self._ensure_text_feature()
+        self._build_tfidf()
 
-    def redistribution_plan_for_product(
-        self,
-        pid: str,
-        top_regions: int = 3,
-        max_fraction: float = 0.5,
-        category_aware: bool = True,
-        tolerance_ratio: float = 0.10,
-    ):
-        """
-        Robust redistribution when true shortages don't exist:
-
-        1) Build sell-through = (units_sold+1) / (inventory_level+1)
-        2) Within product category (or globally), find regions with LOW relative sell-through.
-           Define a pseudo 'gap' that is positive when the region under-performs vs the average.
-        3) Allow tolerance so near-balanced regions still qualify.
-        4) If nothing qualifies, fallback to lowest sell-through regions.
-        5) Suggest quantities capped by max_fraction of available stock, and score with similarity.
-        """
-        idx = self._index_for_pid(pid)
-        if idx is None:
-            return {"error": "product_id not found", "plan": []}
-
-        item = self.df.iloc[idx]
-        source_region = item["region"]
-        category = item["category"]
-        available_qty = int(item["inventory_level"] or 0)
-        if available_qty <= 0:
-            return {
-                "product_id": pid,
-                "source_region": source_region,
-                "category": category,
-                "available_qty": 0,
-                "max_transfer_considered": 0,
-                "tolerance_used": 0.0,
-                "plan": [],
-                "reason_if_empty": "No available inventory to move.",
-                "gap_preview": [],
-            }
-
-        # Build sell-through
-        df = self.df.copy()
-        df["sell_ratio"] = (df["units_sold"].astype(float) + 1.0) / (
-            df["inventory_level"].astype(float) + 1.0
-        )
-        avg_sell_ratio = df["sell_ratio"].mean()
-
-        # Category-aware pool (preferred)
-        if category_aware:
-            pool = df[(df["category"] == category) & (df["region"] != source_region)]
+        # Load partners (optional)
+        if self.partners_csv.exists():
+            self.partners_df = pd.read_csv(self.partners_csv)
         else:
-            pool = df[df["region"] != source_region]
+            self.partners_df = pd.DataFrame(columns=["region", "ngo", "contact"])
 
-        # Aggregate by region
-        region_stats = (
-            pool.groupby("region", dropna=False)
-            .agg(
-                inventory_level=("inventory_level", "sum"),
-                units_sold=("units_sold", "sum"),
-                sell_ratio=("sell_ratio", "mean"),
-                items=("product_id", "count"),
-            )
-            .reset_index()
+        # Ensure donation log exists
+        if not self.donations_log.exists():
+            pd.DataFrame(
+                columns=["timestamp", "product_id", "qty", "region", "partner_name", "contact", "notes"]
+            ).to_csv(self.donations_log, index=False)
+
+    # -----------------------------
+    # Internal helpers
+    # -----------------------------
+    def _normalize_columns(self) -> None:
+        """
+        Make columns snake_case and create fallbacks for known variants.
+        """
+        # Lower + replace spaces/strange chars
+        self.df.columns = (
+            self.df.columns.str.strip()
+            .str.lower()
+            .str.replace(" ", "_")
+            .str.replace("-", "_")
+            .str.replace("/", "_")
         )
 
-        # Pseudo demand gap: regions below avg sell-through get positive "need"
-        region_stats["gap"] = (avg_sell_ratio - region_stats["sell_ratio"]) * region_stats[
-            "inventory_level"
-        ]
-        region_stats["gap"] = region_stats["gap"].fillna(0.0).astype(float)
+        # Map common variants into our canonical names
+        rename_map = {}
+        m = self.cols
 
-        # Tolerance (let near-balanced regions qualify)
-        base = region_stats["gap"].abs().mean() if len(region_stats) else 0.0
-        tol = max(0.0, tolerance_ratio * (base if base > 0 else 1.0))
-        region_stats["eligible"] = region_stats["gap"] > -tol
+        # Product id
+        for cand in ["product_id", "productid", "pid"]:
+            if cand in self.df.columns:
+                rename_map[cand] = m.product_id
+                break
 
-        # Choose targets
-        targets = (
-            region_stats[region_stats["eligible"]]
-            .sort_values("gap", ascending=False)
-            .head(top_regions)
-            .copy()
+        # Category
+        for cand in ["category", "cat"]:
+            if cand in self.df.columns:
+                rename_map[cand] = m.category
+                break
+
+        # Region
+        for cand in ["region", "store_region", "market"]:
+            if cand in self.df.columns:
+                rename_map[cand] = m.region
+                break
+
+        # Inventory
+        for cand in ["inventory_level", "inventory", "stock_on_hand"]:
+            if cand in self.df.columns:
+                rename_map[cand] = m.inventory
+                break
+
+        # Units sold
+        for cand in ["units_sold", "sold", "sales_units"]:
+            if cand in self.df.columns:
+                rename_map[cand] = m.sold
+                break
+
+        # Demand forecast
+        for cand in ["demand_forecast", "forecast", "predicted_demand"]:
+            if cand in self.df.columns:
+                rename_map[cand] = m.forecast
+                break
+
+        # Price
+        for cand in ["price", "unit_price"]:
+            if cand in self.df.columns:
+                rename_map[cand] = m.price
+                break
+
+        # Discount
+        for cand in ["discount", "discount_pct", "markdown"]:
+            if cand in self.df.columns:
+                rename_map[cand] = m.discount
+                break
+
+        # Weather
+        for cand in ["weather_condition", "weather"]:
+            if cand in self.df.columns:
+                rename_map[cand] = m.weather
+                break
+
+        # Promo
+        for cand in ["holiday_promotion", "promotion", "promo", "holiday_promotion_"]:
+            if cand in self.df.columns:
+                rename_map[cand] = m.promo
+                break
+
+        # Competitor pricing
+        for cand in ["competitor_pricing", "competitor_price"]:
+            if cand in self.df.columns:
+                rename_map[cand] = m.competitor
+                break
+
+        if rename_map:
+            self.df.rename(columns=rename_map, inplace=True)
+
+        # Fill required basics if missing
+        for req in [m.product_id, m.category, m.region, m.inventory]:
+            if req not in self.df.columns:
+                raise ValueError(f"Required column '{req}' not found in inventory CSV!")
+
+        # Optional numeric defaults
+        for numc in [m.sold, m.forecast, m.price, m.discount]:
+            if numc not in self.df.columns:
+                self.df[numc] = 0
+
+        # Strings
+        for strc in [m.weather, m.promo, m.competitor]:
+            if strc not in self.df.columns:
+                self.df[strc] = ""
+
+        # Ensure types
+        for col in [m.inventory, m.sold, m.forecast, m.price, m.discount]:
+            self.df[col] = pd.to_numeric(self.df[col], errors="coerce").fillna(0)
+
+        for col in [m.product_id, m.category, m.region, m.weather, m.promo, m.competitor]:
+            self.df[col] = self.df[col].astype(str)
+
+    def _ensure_text_feature(self) -> None:
+        m = self.cols
+        if m.text_feature not in self.df.columns:
+            self.df[m.text_feature] = (
+                self.df[m.category].fillna("")
+                + " "
+                + self.df[m.region].fillna("")
+                + " "
+                + self.df[m.weather].fillna("")
+                + " "
+                + self.df[m.promo].fillna("")
+                + " "
+                + self.df[m.competitor].fillna("")
+            ).str.replace(r"\s+", " ", regex=True).str.strip()
+
+    def _build_tfidf(self) -> None:
+        m = self.cols
+        self.vectorizer = TfidfVectorizer(min_df=1, stop_words="english")
+        self.tfidf = self.vectorizer.fit_transform(self.df[m.text_feature].fillna(""))
+
+        # convenient ID -> index map
+        self.id2idx = {
+            pid: idx for idx, pid in enumerate(self.df[m.product_id].values)
+        }
+
+    # -----------------------------
+    # Public methods used by API
+    # -----------------------------
+    def preview(self, limit: int = 15) -> List[Dict]:
+        return self.df.head(int(limit)).to_dict(orient="records")
+
+    def search(self, keyword: str, limit: int = 20) -> List[Dict]:
+        if not keyword:
+            return []
+        mask = self.df[self.cols.text_feature].str.contains(
+            str(keyword), case=False, na=False
         )
+        return self.df.loc[mask].head(int(limit)).to_dict(orient="records")
 
-        fallback_used = False
-        reason = "Selected regions have lower relative sell-through and suit rebalancing."
-        if targets.empty:
-            # Fallback: pick lowest sell-through regions globally (still excluding source)
-            global_stats = (
-                df[df["region"] != source_region]
-                .groupby("region", dropna=False)
-                .agg(
-                    inventory_level=("inventory_level", "sum"),
-                    units_sold=("units_sold", "sum"),
-                    sell_ratio=("sell_ratio", "mean"),
-                    items=("product_id", "count"),
-                )
-                .reset_index()
-            )
-            targets = global_stats.sort_values("sell_ratio", ascending=True).head(top_regions)
-            fallback_used = True
-            reason = "No true demand regions found — proposing low sell-through regions for rebalancing."
+    def recommendations(self, product_id: str, top_k: int = 5) -> List[Dict]:
+        m = self.cols
+        if product_id not in self.id2idx:
+            return []
+        idx = self.id2idx[product_id]
+        sims = cosine_similarity(self.tfidf[idx], self.tfidf).ravel()
+        order = np.argsort(-sims)
 
-        max_transfer = max(1, int(available_qty * float(max_fraction)))
-        per_region = max(1, int(max_transfer / max(1, top_regions)))
-
-        plan = []
-        for _, trg in targets.iterrows():
-            trg_region = trg["region"]
-            # Similarity to items in target region (prefer same category)
-            if category_aware:
-                trg_idx = self.df.index[
-                    (self.df["region"] == trg_region) & (self.df["category"] == category)
-                ].tolist()
-            else:
-                trg_idx = self.df.index[self.df["region"] == trg_region].tolist()
-
-            if trg_idx:
-                sims = cosine_similarity(self.embeddings[idx], self.embeddings[trg_idx]).flatten()
-                sim = float(sims.max())
-            else:
-                sim = 0.0
-
-            gap_val = float(trg.get("gap", 0.0))
-            plan.append(
+        out = []
+        for j in order:
+            if j == idx:
+                continue
+            row = self.df.iloc[j]
+            out.append(
                 {
-                    "target_region": str(trg_region),
-                    "suggested_qty": int(per_region),
-                    "gap": round(gap_val, 2),
-                    "similarity": round(sim, 3),
-                    "reason": f"{reason} (tol={tol:.2f}).",
+                    "product_id": row[m.product_id],
+                    "category": row[m.category],
+                    "region": row[m.region],
+                    "deadstock": bool(row.get("deadstock_flag", False)),
+                    "similarity": float(sims[j]),
+                    "distance": float(1.0 - sims[j]),
                 }
             )
+            if len(out) >= int(top_k):
+                break
+        return out
 
-        # For diagnostics
-        gap_preview_cols = [
-            c for c in ["region", "inventory_level", "units_sold", "sell_ratio", "gap"] if c in region_stats.columns
-        ]
-        gap_preview = region_stats[gap_preview_cols].to_dict(orient="records")
+    def region_gaps(
+        self, product_id: str, category_aware: bool = True
+    ) -> pd.DataFrame:
+        """
+        Build a simple demand gap per region for the product's category (or all).
+        gap = demand_proxy - supply_proxy
+
+        - supply_proxy = sum inventory_level
+        - demand_proxy = sum (units_sold + demand_forecast)
+        """
+        m = self.cols
+        if product_id not in self.id2idx:
+            return pd.DataFrame(columns=[m.region, "supply", "demand", "gap"])
+
+        row = self.df.iloc[self.id2idx[product_id]]
+        cat = row[m.category]
+
+        df = self.df.copy()
+        if category_aware:
+            df = df[df[m.category] == cat]
+
+        grp = df.groupby(m.region, as_index=False).agg(
+            supply=(m.inventory, "sum"),
+            demand=((m.sold, lambda s: s.sum()) if m.forecast not in df.columns
+                    else (m.sold, "sum"))
+        )
+        # If forecast exists, add it
+        if m.forecast in df.columns:
+            add = df.groupby(m.region, as_index=False)[m.forecast].sum().rename(
+                columns={m.forecast: "forecast"}
+            )
+            grp = grp.merge(add, on=m.region, how="left")
+            grp["demand"] = grp["demand"].fillna(0) + grp["forecast"].fillna(0)
+
+        grp["gap"] = grp["demand"].fillna(0) - grp["supply"].fillna(0)
+        return grp[[m.region, "supply", "demand", "gap"]]
+
+    def redistribution_plan(
+        self,
+        product_id: str,
+        top_regions: int = 2,
+        max_fraction: float = 0.2,
+        tolerance_ratio: float = 0.0,
+        category_aware: bool = True,
+    ) -> Dict:
+        """
+        Heuristic: find regions with largest positive gap and allocate from the
+        source region of the product subject to a max transfer fraction.
+        """
+        m = self.cols
+        if product_id not in self.id2idx:
+            return {"plan": [], "source_region": None, "available_qty": 0}
+
+        row = self.df.iloc[self.id2idx[product_id]]
+        source_region = row[m.region]
+        category = row[m.category]
+
+        # Available inventory at source (for the product's category)
+        mask_src = (self.df[m.region] == source_region)
+        if category_aware:
+            mask_src &= (self.df[m.category] == category)
+        available_qty = int(self.df.loc[mask_src, m.inventory].sum())
+
+        budget = max(0, int(np.floor(available_qty * float(max_fraction))))
+
+        gaps = self.region_gaps(product_id, category_aware=category_aware)
+        # tolerance threshold (absolute)
+        tol = float(tolerance_ratio) * max(1.0, gaps["demand"].abs().max())
+        targets = gaps[gaps["gap"] > tol].sort_values("gap", ascending=False)
+
+        out = []
+        remain = budget
+        for _, r in targets.iterrows():
+            if remain <= 0:
+                break
+            if str(r[m.region]) == str(source_region):
+                continue
+
+            # allocate min of gap and remaining budget / regions left
+            want = int(np.ceil(r["gap"]))
+            if want <= 0:
+                continue
+            qty = min(remain, want)
+            if qty <= 0:
+                continue
+
+            out.append(
+                {
+                    "target_region": r[m.region],
+                    "suggested_qty": int(qty),
+                    "gap": float(r["gap"]),
+                }
+            )
+            remain -= qty
+            if len(out) >= int(top_regions):
+                break
 
         return {
-            "product_id": pid,
-            "source_region": source_region,
-            "category": category,
+            "source_region": str(source_region),
+            "category": str(category),
             "available_qty": int(available_qty),
-            "max_transfer_considered": int(max_transfer),
-            "tolerance_used": round(tol, 3),
-            "category_aware": bool(category_aware),
-            "fallback_to_global": bool(fallback_used),
-            "gap_preview": gap_preview,
-            "plan": plan,
-            "reason_if_empty": None if plan else reason,
+            "max_transfer": int(budget),
+            "tolerance_used": float(tol),
+            "plan": out,
+            "regional_gaps": gaps.sort_values("gap", ascending=False).to_dict(orient="records"),
         }
 
-    # --------------------------- Internal ---------------------------
+    def partners(self, region: Optional[str] = None) -> List[Dict]:
+        if self.partners_df.empty:
+            return []
+        df = self.partners_df.copy()
+        # Normalize partner columns
+        cols = {c.lower().strip(): c for c in df.columns}
+        region_col = next((c for c in df.columns if c.lower() in {"region"}), None)
+        ngo_col = next((c for c in df.columns if c.lower() in {"ngo", "partner", "name"}), None)
+        contact_col = next((c for c in df.columns if "contact" in c.lower()), None)
 
-    def _index_for_pid(self, pid: str):
-        hits = self.df.index[self.df["product_id"].astype(str) == str(pid)].tolist()
-        return hits[0] if hits else None
+        if region is not None and region_col:
+            df = df[df[region_col].astype(str).str.lower() == str(region).lower()]
 
-    def _ensure_processed_csv(self, processed_csv: str) -> Path:
-        """Locate or build processed_inventory.csv from raw if needed."""
-        cwd = Path().resolve()
-        candidates = [
-            cwd / processed_csv,
-            cwd / "data" / "processed_inventory.csv",
-            cwd.parent / "backend" / "data" / "processed_inventory.csv",
-        ]
-        for p in candidates:
-            if p.exists():
-                return p
-
-        # try to build from raw
-        raw_candidates = [
-            cwd / "data" / "retail_inventory.csv",
-            cwd.parent / "data" / "retail_inventory.csv",
-            cwd / "backend" / "data" / "retail_inventory.csv",
-        ]
-        raw_path = next((p for p in raw_candidates if p.exists()), None)
-        if raw_path is None:
-            raise FileNotFoundError(
-                "processed_inventory.csv not found and raw dataset missing.\n"
-                f"Looked for processed at: {[str(p) for p in candidates]}\n"
-                f"Looked for raw at: {[str(p) for p in raw_candidates]}"
-            )
-
-        out_dir = cwd / "backend" / "data"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        out_path = out_dir / "processed_inventory.csv"
-
-        df = pd.read_csv(raw_path)
-        df.columns = [c.strip() for c in df.columns]
-        if "Inventory Level" not in df.columns or "Units Sold" not in df.columns:
-            raise KeyError("Raw CSV missing 'Inventory Level' or 'Units Sold'.")
-
-        df["Inventory Level"] = pd.to_numeric(df["Inventory Level"], errors="coerce")
-        df["Units Sold"] = pd.to_numeric(df["Units Sold"], errors="coerce")
-
-        mean_inv = df["Inventory Level"].mean()
-        mean_sales = df["Units Sold"].mean()
-        df["deadstock_flag"] = (df["Inventory Level"] > mean_inv * 1.5) & (
-            df["Units Sold"] < mean_sales * 0.5
+        df = df.rename(
+            columns={
+                region_col or "region": "region",
+                ngo_col or "ngo": "ngo",
+                contact_col or "contact": "contact",
+            }
         )
 
-        # text_feature
-        text_cols = [
-            "Category",
-            "Region",
-            "Weather Condition",
-            "Holiday/Promotion",
-            "Competitor Pricing",
-        ]
-        for c in text_cols:
-            if c not in df.columns:
-                df[c] = ""
-            df[c] = df[c].astype(str).fillna("")
-        df["text_feature"] = (
-            df["Category"]
-            + " "
-            + df["Region"]
-            + " "
-            + df["Weather Condition"]
-            + " "
-            + df["Holiday/Promotion"]
-            + " "
-            + df["Competitor Pricing"]
-        ).str.strip()
+        return df[["region", "ngo", "contact"]].to_dict(orient="records")
 
-        # rename
-        rename = {
-            "Product ID": "product_id",
-            "Category": "category",
-            "Region": "region",
-            "Inventory Level": "inventory_level",
-            "Units Sold": "units_sold",
+    def log_donation(
+        self, product_id: str, qty: int, region: str, partner_name: str, contact: str, notes: str = ""
+    ) -> Dict:
+        """
+        Append one donation record to donations_log.csv.
+        On Render free tier this is ephemeral (resets on deploy).
+        """
+        ts = pd.Timestamp.utcnow().isoformat()
+        row = {
+            "timestamp": ts,
+            "product_id": str(product_id),
+            "qty": int(qty),
+            "region": str(region),
+            "partner_name": str(partner_name),
+            "contact": str(contact),
+            "notes": str(notes or ""),
         }
-        df.rename(columns=rename, inplace=True)
-
-        df.to_csv(out_path, index=False)
-        print(f"🛠️ Built processed_inventory.csv from raw → {out_path}")
-        return out_path
+        try:
+            pd.DataFrame([row]).to_csv(self.donations_log, mode="a", header=not self.donations_log.exists(), index=False)
+        except Exception:
+            # fallback: try reading to know if header exists
+            if not self.donations_log.exists():
+                pd.DataFrame(columns=list(row.keys())).to_csv(self.donations_log, index=False)
+            pd.DataFrame([row]).to_csv(self.donations_log, mode="a", header=False, index=False)
+        return row
