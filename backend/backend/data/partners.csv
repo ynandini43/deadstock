@@ -1,0 +1,9 @@
+region,ngo,contact,email,phone,address,min_qty,notes
+North,Helping Hands North,Aarav Mehta,hh-north@example.org,+91-98765-00001,12 MG Road,10,Food kits + staples
+North,ReliefWorks Trust North,Neha Kapoor,relief-north@example.org,+91-98765-00002,44 Residency Rd,25,Can take near-expiry packaged groceries
+South,FoodLink South,Vikram Rao,foodlink-south@example.org,+91-98765-00011,88 Bannerghatta Rd,20,Prefers staples and dairy
+South,Care & Share South,Sana Ali,css@example.org,+91-98765-00012,17 Hosur Rd,10,Flexible with quantities
+East,East Hope Foundation,Riya Das,east-hope@example.org,+91-98765-00021,9 EM Bypass,15,Children-focused programs
+East,Green Circle East,Anik Sen,green-east@example.org,+91-98765-00022,224 Park St,10,Accepts packaged food + toiletries
+West,West Aid Network,Rohan Shah,wan@example.org,+91-98765-00031,3 SV Road,20,Can arrange pickup
+West,ZeroWaste West,Divya Iyer,zw-west@example.org,+91-98765-00032,6 Linking Rd,10,Sustainability focus
