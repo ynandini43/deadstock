@@ -1,4 +1,4 @@
-# render.yaml — deploys FastAPI backend + Streamlit frontend
+# render.yaml — deploys FastAPI backend + Streamlit frontend (free tier safe)
 
 services:
   - type: web
@@ -6,37 +6,31 @@ services:
     env: python
     plan: free
     region: oregon
+    rootDir: backend
     buildCommand: |
       pip install --upgrade pip
-      pip install -r backend/requirements.txt
+      pip install -r requirements.txt
     startCommand: |
       uvicorn app.main:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: PYTHONUNBUFFERED
         value: "1"
       - key: DATA_DIR
-        value: /app/data
-    # Monorepo: set working dir to /backend so imports resolve (app.main)
-    rootDir: backend
-    disk:
-      name: backend-data
-      mountPath: /app/data
-      sizeGB: 1
+        value: /app/backend/data  # backend reads/writes here (non-persistent)
 
   - type: web
     name: deadstock-frontend
     env: python
     plan: free
     region: oregon
+    rootDir: frontend
     buildCommand: |
       pip install --upgrade pip
-      pip install -r frontend/requirements.txt
+      pip install -r requirements.txt
     startCommand: |
       streamlit run streamlit_app.py --server.address 0.0.0.0 --server.port $PORT
-    rootDir: frontend
     envVars:
-      # 👇 After backend deploys, edit this in the Render dashboard to your real API URL
       - key: API_URL
-        value: https://deadstock-backend.onrender.com
+        value: https://deadstock-backend.onrender.com  # will update after backend deploys
       - key: PYTHONUNBUFFERED
         value: "1"
